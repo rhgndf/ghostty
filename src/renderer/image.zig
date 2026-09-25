@@ -311,7 +311,6 @@ pub const State = struct {
                 );
                 continue;
             };
-            if (image.data.isPending()) continue;
             self.prepKittyImage(alloc, &image) catch |err| {
                 log.warn("error preparing kitty image err={}", .{err});
                 continue;

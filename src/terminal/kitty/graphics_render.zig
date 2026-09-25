@@ -42,6 +42,8 @@ pub const Fragment = struct {
     /// Storage key of the placement that produced this fragment. For virtual
     /// fragments this is the definition resolved by ImageStorage.placeholderTarget.
     key: ImageStorage.PlacementKey,
+    image_generation: u64,
+    placement_generation: u64,
     z: i32,
     /// Viewport cell origin; may be negative / beyond edges for ordinary placements (not clipped).
     x: i32,
@@ -95,7 +97,6 @@ pub fn collect(
     const bot_y = (screen.pages.pointFromPin(.screen, bot) orelse return).screen.y;
 
     const PendingRelative = struct {
-        image_id: u32,
         key: ImageStorage.PlacementKey,
         p: ImageStorage.Placement,
         root_key: ImageStorage.PlacementKey,
@@ -105,38 +106,35 @@ pub fn collect(
     var pending_relative: std.ArrayListUnmanaged(PendingRelative) = .empty;
     defer pending_relative.deinit(alloc);
 
+    var depends_on_cells = false;
     var it = storage.placements.iterator();
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         const p = entry.value_ptr;
 
-        const origin: union(enum) {
-            pin: *terminal.Pin,
-            relative: struct {
-                pin: *terminal.Pin,
-                horizontal_offset: i32,
-                vertical_offset: i32,
+        const pin, const horizontal_offset, const vertical_offset = switch (p.location) {
+            .pin => |pin| .{ pin, @as(i32, 0), @as(i32, 0) },
+            .virtual => {
+                depends_on_cells = true;
+                continue;
             },
-        } = switch (p.location) {
-            .pin => |pin| .{ .pin = pin },
-            .virtual => continue,
-            .relative => |rel| origin: {
+            .relative => |rel| relative_origin: {
                 const chain = storage.resolveChain(rel) orelse continue;
                 switch (chain.root.location) {
-                    .pin => |pin| break :origin .{ .relative = .{
-                        .pin = pin,
-                        .horizontal_offset = chain.horizontal_offset,
-                        .vertical_offset = chain.vertical_offset,
-                    } },
+                    .pin => |pin| break :relative_origin .{
+                        pin,
+                        chain.horizontal_offset,
+                        chain.vertical_offset,
+                    },
                     .virtual => {
                         try pending_relative.append(alloc, .{
-                            .image_id = key.image_id,
                             .key = key,
                             .p = p.*,
                             .root_key = chain.root_key,
                             .horizontal_offset = chain.horizontal_offset,
                             .vertical_offset = chain.vertical_offset,
                         });
+                        depends_on_cells = true;
                         continue;
                     },
                     .relative => unreachable,
@@ -150,10 +148,6 @@ pub fn collect(
         };
         if (image.data.isPending()) continue;
 
-        const pin, const horizontal_offset, const vertical_offset = switch (origin) {
-            .pin => |pin| .{ pin, @as(i32, 0), @as(i32, 0) },
-            .relative => |value| .{ value.pin, value.horizontal_offset, value.vertical_offset },
-        };
         if (pin.garbage) continue;
 
         const grid = p.gridSize(image, t);
@@ -177,6 +171,8 @@ pub fn collect(
             .kind = .placement,
             .image_id = image.id,
             .key = key,
+            .image_generation = image.generation,
+            .placement_generation = p.generation,
             .z = p.z,
             .x = x,
             .y = y,
@@ -191,7 +187,7 @@ pub fn collect(
         });
     }
 
-    if (dependsOnCells(storage) and cell_size.width > 0 and cell_size.height > 0) {
+    if (depends_on_cells and cell_size.width > 0 and cell_size.height > 0) {
         var virtual_origins: std.AutoHashMapUnmanaged(
             ImageStorage.PlacementKey,
             struct { x: u32, y: u32 },
@@ -200,12 +196,11 @@ pub fn collect(
 
         var virtual_it = terminal.kitty.graphics.unicode.placementIterator(top, bot);
         while (virtual_it.next()) |virtual_p| {
-            const target = storage.placeholderTarget(
+            const resolved_target = storage.placeholderTarget(
                 virtual_p.image_id,
                 virtual_p.placement_id,
-            );
+            ) orelse continue;
             if (pending_relative.items.len > 0) fold: {
-                const resolved_target = target orelse break :fold;
                 const viewport = screen.pages.pointFromPin(.viewport, virtual_p.pin) orelse break :fold;
                 const gop = try virtual_origins.getOrPut(alloc, resolved_target.key);
                 if (!gop.found_existing) {
@@ -236,12 +231,13 @@ pub fn collect(
             };
             if (rp.dest_width == 0 or rp.dest_height == 0) continue;
 
-            const resolved_target = target orelse continue;
             const viewport = screen.pages.pointFromPin(.viewport, rp.top_left) orelse continue;
             try list.append(alloc, .{
                 .kind = .virtual,
                 .image_id = image.id,
                 .key = resolved_target.key,
+                .image_generation = image.generation,
+                .placement_generation = resolved_target.placement.generation,
                 .z = -1,
                 .x = rp.top_left.x,
                 .y = @intCast(viewport.viewport.y),
@@ -258,7 +254,7 @@ pub fn collect(
 
         for (pending_relative.items) |relative| {
             const origin = virtual_origins.get(relative.root_key) orelse continue;
-            const image = storage.imageById(relative.image_id) orelse continue;
+            const image = storage.imageById(relative.key.image_id) orelse continue;
             if (image.data.isPending()) continue;
 
             const grid = relative.p.gridSize(image, t);
@@ -278,6 +274,8 @@ pub fn collect(
                 .kind = .placement,
                 .image_id = image.id,
                 .key = relative.key,
+                .image_generation = image.generation,
+                .placement_generation = relative.p.generation,
                 .z = relative.p.z,
                 .x = x_pos,
                 .y = y_pos,

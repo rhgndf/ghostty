@@ -60,10 +60,6 @@ const RenderPlacementIteratorWrapper = if (build_options.kitty_graphics)
     struct {
         alloc: std.mem.Allocator,
         fragments: std.ArrayListUnmanaged(kitty_render.Fragment) = .empty,
-        meta: std.ArrayListUnmanaged(struct {
-            image_generation: u64,
-            placement_generation: u64,
-        }) = .empty,
         storage: ?*kitty_storage.ImageStorage = null,
         index: ?usize = null,
         layer_filter: PlacementLayer = .all,
@@ -413,7 +409,6 @@ pub fn render_placement_iterator_free(
     if (comptime !build_options.kitty_graphics) return;
     const iter = iter_ orelse return;
     iter.fragments.deinit(iter.alloc);
-    iter.meta.deinit(iter.alloc);
     iter.alloc.destroy(iter);
 }
 
@@ -462,40 +457,19 @@ pub fn render_placement_iterator_update(
     const t = wrapper.terminal;
     const storage = &t.screens.active.kitty_images;
 
-    iter.index = null;
-    iter.storage = storage;
-    iter.meta.clearRetainingCapacity();
     const result = kitty_render.collect(iter.alloc, t, .{
         .width = if (t.cols == 0) 0 else t.width_px / t.cols,
         .height = if (t.rows == 0) 0 else t.height_px / t.rows,
     }, &iter.fragments);
     result catch {
         iter.fragments.clearRetainingCapacity();
-        iter.meta.clearRetainingCapacity();
         iter.storage = null;
+        iter.index = null;
         return .out_of_memory;
     };
 
-    iter.meta.ensureTotalCapacity(iter.alloc, iter.fragments.items.len) catch {
-        iter.fragments.clearRetainingCapacity();
-        iter.meta.clearRetainingCapacity();
-        iter.storage = null;
-        return .out_of_memory;
-    };
-
-    var retained: usize = 0;
-    for (iter.fragments.items) |fragment| {
-        const image = storage.images.getPtr(fragment.image_id) orelse continue;
-        const placement = storage.placements.get(fragment.key) orelse continue;
-
-        iter.fragments.items[retained] = fragment;
-        iter.meta.appendAssumeCapacity(.{
-            .image_generation = image.generation,
-            .placement_generation = placement.generation,
-        });
-        retained += 1;
-    }
-    iter.fragments.items.len = retained;
+    iter.storage = storage;
+    iter.index = null;
     return .success;
 }
 
@@ -531,7 +505,6 @@ pub fn render_placement_get(
     const fragment = iter.fragments.items[index];
     const storage = iter.storage orelse return .invalid_value;
     const image = storage.images.getPtr(fragment.image_id) orelse return .invalid_value;
-    const meta = iter.meta.items[index];
 
     out.kind = switch (fragment.kind) {
         .placement => .placement,
@@ -540,8 +513,8 @@ pub fn render_placement_get(
     out.image = image;
     out.image_id = fragment.image_id;
     out.placement_id = fragment.key.placement_id.id;
-    out.image_generation = meta.image_generation;
-    out.placement_generation = meta.placement_generation;
+    out.image_generation = fragment.image_generation;
+    out.placement_generation = fragment.placement_generation;
     out.z = fragment.z;
     out.viewport_col = fragment.x;
     out.viewport_row = fragment.y;
@@ -2427,7 +2400,6 @@ fn renderTestDiacritic(index: u32) []const u8 {
         0 => "\u{0305}",
         1 => "\u{030D}",
         2 => "\u{030E}",
-        3 => "\u{0310}",
         else => unreachable,
     };
 }
