@@ -400,6 +400,12 @@ comptime {
             @export(&c.kitty_graphics_placement_viewport_pos, .{ .name = "ghostty_kitty_graphics_placement_viewport_pos" });
             @export(&c.kitty_graphics_placement_source_rect, .{ .name = "ghostty_kitty_graphics_placement_source_rect" });
             @export(&c.kitty_graphics_placement_render_info, .{ .name = "ghostty_kitty_graphics_placement_render_info" });
+            @export(&c.kitty_graphics_render_placement_iterator_new, .{ .name = "ghostty_kitty_graphics_render_placement_iterator_new" });
+            @export(&c.kitty_graphics_render_placement_iterator_free, .{ .name = "ghostty_kitty_graphics_render_placement_iterator_free" });
+            @export(&c.kitty_graphics_render_placement_iterator_set, .{ .name = "ghostty_kitty_graphics_render_placement_iterator_set" });
+            @export(&c.kitty_graphics_render_placement_iterator_update, .{ .name = "ghostty_kitty_graphics_render_placement_iterator_update" });
+            @export(&c.kitty_graphics_render_placement_next, .{ .name = "ghostty_kitty_graphics_render_placement_next" });
+            @export(&c.kitty_graphics_render_placement_get, .{ .name = "ghostty_kitty_graphics_render_placement_get" });
         }
         if (features.grid_introspection) {
             @export(&c.grid_ref_cell, .{ .name = "ghostty_grid_ref_cell" });

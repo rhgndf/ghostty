@@ -11,7 +11,7 @@
 //! aim to ship a v1 of this implementation came at some cost. I learned a lot
 //! though and I think we can go back through and fix this up.
 
-const render = @import("graphics_render.zig");
+pub const render = @import("graphics_render.zig");
 const command = @import("graphics_command.zig");
 const exec = @import("graphics_exec.zig");
 const image = @import("graphics_image.zig");

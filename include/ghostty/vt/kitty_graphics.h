@@ -84,6 +84,29 @@ extern "C" {
  * - ghostty_kitty_graphics_placement_rect() — bounding rectangle as a
  *   @ref GhosttySelection.
  *
+ * ## Rendering Placements
+ *
+ * Use a @ref GhosttyKittyGraphicsRenderPlacementIterator to get the
+ * expanded list consumed by Ghostty's renderer, including ordinary
+ * placements, virtual U=1 placeholder fragments, and relative placements
+ * rooted at virtual definitions. Update the iterator after terminal changes
+ * using ghostty_kitty_graphics_render_placement_iterator_update().
+ *
+ * The list is sorted in stable renderer draw order: ascending z, image ID,
+ * placement key tag (internal before external), placement ID, viewport row,
+ * then viewport column. Virtual fragments use z=-1, so they are included in
+ * the BELOW_TEXT layer. Ordinary placements are not clipped to the viewport;
+ * their origins and destination geometry may extend beyond its edges. The
+ * embedder must scissor drawing to the viewport, as it would for
+ * ghostty_kitty_graphics_placement_viewport_pos(). Virtual fragments are
+ * expanded from placeholder cells and remain within a single viewport row.
+ *
+ * The iterator owns a copy of the fragment geometry. Its image handle and
+ * pixel data pointers are borrowed from the terminal and remain valid only
+ * while the terminal is not mutated. A terminal must have pixel geometry
+ * (set by resizing with non-zero cell pixel dimensions) for placements to
+ * produce renderable geometry.
+ *
  * ## Change Detection
  *
  * Generation stamps allow renderers to cheaply detect whether Kitty
@@ -101,6 +124,14 @@ extern "C" {
  *   should treat a cached texture as stale when this differs from the
  *   cached value; dimension/length heuristics cannot detect a
  *   same-sized retransmission.
+ * - @ref GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_GENERATION changes when
+ *   a placement is added or replaced under its key. Scrolling and other
+ *   geometry changes do not change it.
+ * - @ref GHOSTTY_KITTY_GRAPHICS_DATA_CELL_DEPENDENT is true when virtual
+ *   placements or relative placements rooted at virtual definitions make
+ *   the render list depend on viewport cell contents. Recompute the render
+ *   placement iterator after cell changes even when storage generation is
+ *   unchanged.
  *
  * Stamps are unique and monotonically increasing process-wide, so
  * caches keyed on a generation value never alias across screens
@@ -164,6 +195,15 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: uint64_t *
    */
   GHOSTTY_KITTY_GRAPHICS_DATA_GENERATION = 2,
+  /**
+   * Whether render placements depend on viewport cell contents.
+   *
+   * Output type: bool *
+   *
+   * When true, recompute render placements whenever cell contents change,
+   * even if GHOSTTY_KITTY_GRAPHICS_DATA_GENERATION is unchanged.
+   */
+  GHOSTTY_KITTY_GRAPHICS_DATA_CELL_DEPENDENT = 3,
   GHOSTTY_KITTY_GRAPHICS_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyGraphicsData;
 
@@ -259,6 +299,15 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: int32_t *
    */
   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z = 12,
+
+  /**
+   * Generation stamp assigned when this placement is added or replaced
+   * under its storage key. Scrolling and other geometry changes do not
+   * change this value.
+   *
+   * Output type: uint64_t *
+   */
+  GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_GENERATION = 13,
 
   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyKittyGraphicsPlacementData;
@@ -485,6 +534,72 @@ typedef struct {
   /** Resolved source rectangle height in pixels. */
   uint32_t source_height;
 } GhosttyKittyGraphicsPlacementRenderInfo;
+
+/**
+ * Kind of a fragment returned by the render-placement iterator.
+ *
+ * PLACEMENT includes pin placements and relative placements, including
+ * relative placements rooted at a virtual definition. VIRTUAL is one
+ * horizontal run of placeholder cells for a virtual placement.
+ *
+ * @ingroup kitty_graphics
+ */
+typedef enum GHOSTTY_ENUM_TYPED {
+  GHOSTTY_KITTY_RENDER_PLACEMENT_KIND_PLACEMENT = 0,
+  GHOSTTY_KITTY_RENDER_PLACEMENT_KIND_VIRTUAL = 1,
+  GHOSTTY_KITTY_RENDER_PLACEMENT_KIND_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
+} GhosttyKittyRenderPlacementKind;
+
+/**
+ * One renderable fragment from the active screen's viewport.
+ *
+ * Geometry and generation values are copied into the iterator. The image
+ * handle is borrowed from terminal storage and is invalidated by any
+ * mutating terminal call.
+ *
+ * Initialize with GHOSTTY_INIT_SIZED(GhosttyKittyGraphicsRenderPlacement)
+ * before calling ghostty_kitty_graphics_render_placement_get().
+ *
+ * @ingroup kitty_graphics
+ */
+typedef struct {
+  /** Size of this struct in bytes. */
+  size_t size;
+  /** Fragment kind. */
+  GhosttyKittyRenderPlacementKind kind;
+  /** Borrowed handle for the fragment's source image. */
+  GhosttyKittyGraphicsImage image;
+  /** Image ID. */
+  uint32_t image_id;
+  /** Placement ID, including the resolved definition ID for virtual fragments. */
+  uint32_t placement_id;
+  /** Generation of the source image. */
+  uint64_t image_generation;
+  /** Generation of the source placement or virtual definition. */
+  uint64_t placement_generation;
+  /** Effective z-index (virtual fragments use -1). */
+  int32_t z;
+  /** Viewport-relative cell column; ordinary placements are not clipped. */
+  int32_t viewport_col;
+  /** Viewport-relative cell row; ordinary placements are not clipped. */
+  int32_t viewport_row;
+  /** Pixel offset from the origin cell's left edge. */
+  uint32_t offset_x;
+  /** Pixel offset from the origin cell's top edge. */
+  uint32_t offset_y;
+  /** Destination width in pixels. */
+  uint32_t dest_width;
+  /** Destination height in pixels. */
+  uint32_t dest_height;
+  /** Source rectangle x origin in pixels. */
+  uint32_t source_x;
+  /** Source rectangle y origin in pixels. */
+  uint32_t source_y;
+  /** Source rectangle width in pixels. */
+  uint32_t source_width;
+  /** Source rectangle height in pixels. */
+  uint32_t source_height;
+} GhosttyKittyGraphicsRenderPlacement;
 
 /**
  * Get data from a kitty graphics storage instance.
@@ -846,7 +961,8 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_placement_source_rect(
  *
  * When viewport_visible is false, the placement is fully off-screen
  * or is a virtual placement; viewport_col and viewport_row may
- * contain meaningless values in that case.
+ * contain meaningless values in that case. Virtual placements are
+ * expanded by the render-placement iterator.
  *
  * @param iterator The iterator positioned on a placement
  * @param image The image handle for this placement's image
@@ -861,6 +977,105 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_placement_render_info(
     GhosttyKittyGraphicsImage image,
     GhosttyTerminal terminal,
     GhosttyKittyGraphicsPlacementRenderInfo* out_info);
+
+/**
+ * Create a render-placement iterator.
+ *
+ * The iterator owns its fragment list and must be freed with
+ * ghostty_kitty_graphics_render_placement_iterator_free().
+ *
+ * @param allocator Pointer to allocator, or NULL to use the default allocator
+ * @param[out] out_iterator On success, receives the iterator handle
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE if out_iterator
+ *         is NULL, GHOSTTY_OUT_OF_MEMORY on allocation failure, or
+ *         GHOSTTY_NO_VALUE when Kitty graphics are disabled
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_render_placement_iterator_new(
+    const GhosttyAllocator* allocator,
+    GhosttyKittyGraphicsRenderPlacementIterator* out_iterator);
+
+/**
+ * Free a render-placement iterator. NULL is accepted.
+ *
+ * @param iterator The iterator handle to free
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API void ghostty_kitty_graphics_render_placement_iterator_free(
+    GhosttyKittyGraphicsRenderPlacementIterator iterator);
+
+/**
+ * Set an option on a render-placement iterator.
+ *
+ * Use GHOSTTY_KITTY_GRAPHICS_PLACEMENT_ITERATOR_OPTION_LAYER with a
+ * GhosttyKittyPlacementLayer value. Filtering uses each fragment's effective
+ * z-index, so virtual fragments (z=-1) match BELOW_TEXT.
+ *
+ * @param iterator The iterator handle
+ * @param option The option to set
+ * @param value Pointer to the value; NULL returns GHOSTTY_INVALID_VALUE
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE for invalid
+ *         arguments, or GHOSTTY_NO_VALUE when Kitty graphics are disabled
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_render_placement_iterator_set(
+    GhosttyKittyGraphicsRenderPlacementIterator iterator,
+    GhosttyKittyGraphicsPlacementIteratorOption option,
+    const void* value);
+
+/**
+ * Recompute the render-placement snapshot from the terminal's active
+ * screen and viewport. Pixel geometry must be set by resizing the terminal
+ * with non-zero cell pixel dimensions.
+ *
+ * The iterator retains its layer filter and resets to before-first after
+ * the update. The geometry is copied, but image handles and pixel pointers
+ * remain borrowed and are invalidated by any mutating terminal call.
+ *
+ * @param iterator The iterator handle
+ * @param terminal The terminal handle
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE if either
+ *         handle is NULL, GHOSTTY_OUT_OF_MEMORY on allocation failure, or
+ *         GHOSTTY_NO_VALUE when Kitty graphics are disabled
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_render_placement_iterator_update(
+    GhosttyKittyGraphicsRenderPlacementIterator iterator,
+    GhosttyTerminal terminal);
+
+/**
+ * Advance to the next renderable placement that matches the layer filter.
+ *
+ * @param iterator The iterator handle (may be NULL)
+ * @return true if advanced to a fragment, false if at the end
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API bool ghostty_kitty_graphics_render_placement_next(
+    GhosttyKittyGraphicsRenderPlacementIterator iterator);
+
+/**
+ * Get the current render-placement fragment.
+ *
+ * Call ghostty_kitty_graphics_render_placement_next() at least once before
+ * calling this function. Initialize out_placement with
+ * GHOSTTY_INIT_SIZED(GhosttyKittyGraphicsRenderPlacement).
+ *
+ * @param iterator The iterator handle
+ * @param[out] out_placement Receives the fragment
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_INVALID_VALUE if the iterator
+ *         is NULL/unpositioned or the output struct is undersized, or
+ *         GHOSTTY_NO_VALUE when Kitty graphics are disabled
+ *
+ * @ingroup kitty_graphics
+ */
+GHOSTTY_API GhosttyResult ghostty_kitty_graphics_render_placement_get(
+    GhosttyKittyGraphicsRenderPlacementIterator iterator,
+    GhosttyKittyGraphicsRenderPlacement* out_placement);
 
 /** @} */
 

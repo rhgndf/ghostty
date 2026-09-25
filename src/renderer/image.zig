@@ -4,6 +4,7 @@ const assert = @import("../quirks.zig").inlineAssert;
 const wuffs = @import("wuffs");
 const terminal = @import("../terminal/main.zig");
 const global = @import("../global.zig");
+const kitty_render = terminal.kitty.graphics.render;
 
 const Renderer = @import("../renderer.zig").Renderer;
 const GraphicsAPI = Renderer.API;
@@ -23,15 +24,15 @@ pub const State = struct {
 
     /// The placements for the Kitty image protocol.
     kitty_placements: std.ArrayListUnmanaged(Placement),
+    kitty_fragments: std.ArrayListUnmanaged(kitty_render.Fragment),
 
     /// The end index (exclusive) for placements that should be
     /// drawn below the background, below the text, etc.
     kitty_bg_end: u32,
     kitty_text_end: u32,
 
-    /// True if there are any virtual placements. This needs to be known
-    /// because virtual placements need to be recalculated more often
-    /// on frame builds and are generally more expensive to handle.
+    /// True if virtual placements or relatives rooted at virtual
+    /// placements make render geometry depend on viewport cell contents.
     kitty_virtual: bool,
 
     /// Overlays
@@ -40,6 +41,7 @@ pub const State = struct {
     pub const empty: State = .{
         .images = .empty,
         .kitty_placements = .empty,
+        .kitty_fragments = .empty,
         .kitty_bg_end = 0,
         .kitty_text_end = 0,
         .kitty_virtual = false,
@@ -53,6 +55,7 @@ pub const State = struct {
             self.images.deinit(alloc);
         }
         self.kitty_placements.deinit(alloc);
+        self.kitty_fragments.deinit(alloc);
         self.overlay_placements.deinit(alloc);
     }
 
@@ -292,219 +295,44 @@ pub const State = struct {
             }
         }
 
-        // The top-left and bottom-right corners of our viewport in screen
-        // points. This lets us determine offsets and containment of placements.
-        const top = t.screens.active.pages.getTopLeft(.viewport);
-        const bot = t.screens.active.pages.getBottomRight(.viewport).?;
-        const top_y = t.screens.active.pages.pointFromPin(.screen, top).?.screen.y;
-        const bot_y = t.screens.active.pages.pointFromPin(.screen, bot).?.screen.y;
+        self.kitty_virtual = kitty_render.dependsOnCells(storage);
+        kitty_render.collect(alloc, t, .{
+            .width = cell_size.width,
+            .height = cell_size.height,
+        }, &self.kitty_fragments) catch |err| {
+            log.warn("error collecting kitty render placements err={}", .{err});
+        };
 
-        // Relative placements whose parent chain roots at a virtual
-        // placement can only be positioned once the placeholder cells
-        // have been scanned below, so they are collected here first.
-        var pending_relative: std.ArrayListUnmanaged(struct {
-            image_id: u32,
-            p: terminal.kitty.graphics.ImageStorage.Placement,
-            root_key: terminal.kitty.graphics.ImageStorage.PlacementKey,
-            horizontal_offset: i32,
-            vertical_offset: i32,
-        }) = .empty;
-        defer pending_relative.deinit(alloc);
-
-        // Go through the placements and ensure the image is
-        // on the GPU or else is ready to be sent to the GPU.
-        var it = storage.placements.iterator();
-        while (it.next()) |kv| {
-            const p = kv.value_ptr;
-
-            // Special logic based on location
-            const origin: Origin = switch (p.location) {
-                .pin => |pin| .{ .pin = pin },
-
-                .virtual => {
-                    // We need to mark virtual placements on our renderer so that
-                    // we know to rebuild in more scenarios since cell changes can
-                    // now trigger placement changes.
-                    self.kitty_virtual = true;
-
-                    // We also continue out because virtual placements are
-                    // only triggered by the unicode placeholder, not by the
-                    // placement itself.
-                    continue;
-                },
-
-                .relative => |rel| origin: {
-                    // An unresolvable chain is never drawn. This only
-                    // happens transiently (storage reaps orphans) or for
-                    // chains re-parented too deep, which kitty doesn't
-                    // draw either.
-                    const chain = storage.resolveChain(rel) orelse continue;
-                    switch (chain.root.location) {
-                        // Rooted at a pin: anchored at the root's pin,
-                        // offset by the accumulated chain offsets.
-                        .pin => |root_pin| break :origin .{
-                            .pin = root_pin,
-                            .horizontal_offset = chain.horizontal_offset,
-                            .vertical_offset = chain.vertical_offset,
-                        },
-
-                        // Rooted at a virtual placement: positioned from
-                        // the root's placeholder cells, which we only
-                        // know after the placeholder scan below. The
-                        // placeholders also move with cell changes so we
-                        // must rebuild every frame, like virtuals.
-                        .virtual => {
-                            self.kitty_virtual = true;
-                            pending_relative.append(alloc, .{
-                                .image_id = kv.key_ptr.image_id,
-                                .p = p.*,
-                                .root_key = chain.root_key,
-                                .horizontal_offset = chain.horizontal_offset,
-                                .vertical_offset = chain.vertical_offset,
-                            }) catch |err| {
-                                log.warn("error deferring relative placement err={}", .{err});
-                            };
-                            continue;
-                        },
-
-                        // resolveChain roots are never relative.
-                        .relative => unreachable,
-                    }
-                },
-            };
-
-            // Get the image for the placement
-            const image = storage.imageById(kv.key_ptr.image_id) orelse {
+        for (self.kitty_fragments.items) |fragment| {
+            const image = storage.imageById(fragment.image_id) orelse {
                 log.warn(
                     "missing image for placement, ignoring image_id={}",
-                    .{kv.key_ptr.image_id},
+                    .{fragment.image_id},
                 );
                 continue;
             };
-
-            self.prepKittyPlacement(
-                alloc,
-                t,
-                top_y,
-                bot_y,
-                &image,
-                p,
-                origin,
-            ) catch |err| {
-                // For errors we log and continue. We try to place
-                // other placements even if one fails.
-                log.warn("error preparing kitty placement err={}", .{err});
+            if (image.data.isPending()) continue;
+            self.prepKittyImage(alloc, &image) catch |err| {
+                log.warn("error preparing kitty image err={}", .{err});
+                continue;
+            };
+            self.kitty_placements.append(alloc, .{
+                .image_id = .{ .kitty = fragment.image_id },
+                .x = fragment.x,
+                .y = fragment.y,
+                .z = fragment.z,
+                .width = fragment.width,
+                .height = fragment.height,
+                .cell_offset_x = fragment.offset_x,
+                .cell_offset_y = fragment.offset_y,
+                .source_x = fragment.source_x,
+                .source_y = fragment.source_y,
+                .source_width = fragment.source_width,
+                .source_height = fragment.source_height,
+            }) catch |err| {
+                log.warn("error appending kitty placement err={}", .{err});
             };
         }
-
-        // If we have virtual placements then we need to scan for placeholders.
-        if (self.kitty_virtual) {
-            // The minimum placeholder cell seen per virtual placement,
-            // in viewport coordinates. This is the origin for relative
-            // placements rooted at a virtual placement: kitty positions
-            // those at the min-x/min-y of the parent's placeholder
-            // cells. Only tracked when such placements exist.
-            var virtual_origins: std.AutoHashMapUnmanaged(
-                terminal.kitty.graphics.ImageStorage.PlacementKey,
-                struct { x: u32, y: u32 },
-            ) = .empty;
-            defer virtual_origins.deinit(alloc);
-
-            var v_it = terminal.kitty.graphics.unicode.placementIterator(top, bot);
-            while (v_it.next()) |virtual_p| {
-                self.prepKittyVirtualPlacement(
-                    alloc,
-                    t,
-                    &virtual_p,
-                    cell_size,
-                ) catch |err| {
-                    // For errors we log and continue. We try to place
-                    // other placements even if one fails.
-                    log.warn("error preparing kitty placement err={}", .{err});
-                };
-
-                // We need to track the origins of all the placeholders
-                // when we have relative cells so that we can calculate
-                // the proper offsets later.
-                if (pending_relative.items.len > 0) fold: {
-                    // Find the target for this virtual placeholder.
-                    const target = storage.placeholderTarget(
-                        virtual_p.image_id,
-                        virtual_p.placement_id,
-                    ) orelse break :fold;
-
-                    // Get the actual viewport position for it.
-                    const vp = t.screens.active.pages.pointFromPin(
-                        .viewport,
-                        virtual_p.pin,
-                    ) orelse break :fold;
-
-                    // Add the origin for this target
-                    const gop = virtual_origins.getOrPut(
-                        alloc,
-                        target.key,
-                    ) catch |err| {
-                        log.warn("error tracking virtual origin err={}", .{err});
-                        break :fold;
-                    };
-                    if (!gop.found_existing) {
-                        gop.value_ptr.* = .{ .x = vp.viewport.x, .y = vp.viewport.y };
-                    } else {
-                        gop.value_ptr.x = @min(gop.value_ptr.x, vp.viewport.x);
-                        gop.value_ptr.y = @min(gop.value_ptr.y, vp.viewport.y);
-                    }
-                }
-            }
-
-            // Position the relative placements rooted at virtual
-            // placements now that the placeholder cells are known. A
-            // root with no placeholders on screen leaves its relative
-            // placements undrawn, matching kitty.
-            for (pending_relative.items) |pr| {
-                const origin = virtual_origins.get(pr.root_key) orelse continue;
-                const image = storage.imageById(pr.image_id) orelse continue;
-                if (image.data.isPending()) continue;
-
-                const grid = pr.p.gridSize(image, t);
-                if (grid.cols == 0 or grid.rows == 0) continue;
-
-                // Viewport-relative signed position; cull placements
-                // entirely outside the viewport.
-                const x: i64 = @as(i64, origin.x) + pr.horizontal_offset;
-                const y: i64 = @as(i64, origin.y) + pr.vertical_offset;
-                if (y >= t.rows or y + grid.rows - 1 < 0) continue;
-                if (x >= t.cols or x + grid.cols - 1 < 0) continue;
-
-                self.appendKittyPlacement(
-                    alloc,
-                    t,
-                    &image,
-                    &pr.p,
-                    std.math.cast(i32, x) orelse continue,
-                    std.math.cast(i32, y) orelse continue,
-                ) catch |err| {
-                    log.warn("error preparing kitty placement err={}", .{err});
-                };
-            }
-        }
-
-        // Sort the placements by their Z value.
-        std.mem.sortUnstable(
-            Placement,
-            self.kitty_placements.items,
-            {},
-            struct {
-                fn lessThan(
-                    ctx: void,
-                    lhs: Placement,
-                    rhs: Placement,
-                ) bool {
-                    _ = ctx;
-                    return lhs.z < rhs.z or
-                        (lhs.z == rhs.z and lhs.image_id.zLessThan(rhs.image_id));
-                }
-            }.lessThan,
-        );
 
         // Find our indices. The values are sorted by z so we can
         // find the first placement out of bounds to find the limits.
@@ -529,169 +357,6 @@ pub const State = struct {
         OutOfMemory,
         ImageConversionError,
     };
-
-    /// Where a placement is anchored on screen: a pin, plus cell
-    /// offsets from it for relative placements. The pin is the
-    /// placement's own pin for pin placements; for relative placements
-    /// it is the root of the parent chain and the offsets are the
-    /// accumulated chain offsets in cells.
-    const Origin = struct {
-        pin: *const terminal.Pin,
-        horizontal_offset: i32 = 0,
-        vertical_offset: i32 = 0,
-    };
-
-    /// Get the viewport-relative position for this placement and add it
-    /// to the placements list.
-    fn prepKittyPlacement(
-        self: *State,
-        alloc: Allocator,
-        t: *const terminal.Terminal,
-        top_y: u32,
-        bot_y: u32,
-        image: *const terminal.kitty.graphics.Image,
-        p: *const terminal.kitty.graphics.ImageStorage.Placement,
-        origin: Origin,
-    ) PrepImageError!void {
-        // Keep the native placement but do not create a renderer placement or
-        // texture until the decoded bytes arrive.
-        if (image.data.isPending()) return;
-
-        // An origin whose tracked content was pruned has no position.
-        if (origin.pin.garbage) return;
-
-        // The size of the placement in grid cells. A zero size can
-        // occur when pixel geometry is unavailable; nothing to place.
-        const grid = p.gridSize(image.*, t);
-        if (grid.cols == 0 or grid.rows == 0) return;
-
-        // This is expensive but necessary.
-        const origin_y = t.screens.active.pages.pointFromPin(
-            .screen,
-            origin.pin.*,
-        ).?.screen.y;
-
-        // The placement's edges in screen coordinates. Chain offsets
-        // are signed: a relative placement can hang above or to the
-        // left of its origin, so this math must be signed and widened.
-        const img_top_y: i64 = @as(i64, origin_y) + origin.vertical_offset;
-        const img_bot_y: i64 = img_top_y + grid.rows - 1;
-        const img_left_x: i64 = @as(i64, origin.pin.x) + origin.horizontal_offset;
-        const img_right_x: i64 = img_left_x + grid.cols - 1;
-
-        // If the placement isn't within our viewport then skip it.
-        if (img_top_y > bot_y or img_bot_y < top_y) return;
-        if (img_left_x >= t.cols or img_right_x < 0) return;
-
-        // Viewport-relative position. Offsets so extreme that the
-        // position is unrepresentable have no renderable pixels.
-        const y_pos = std.math.cast(i32, img_top_y - top_y) orelse return;
-        const x_pos = std.math.cast(i32, img_left_x) orelse return;
-
-        try self.appendKittyPlacement(alloc, t, image, p, x_pos, y_pos);
-    }
-
-    /// Compute the sizes for a native kitty placement positioned at the
-    /// given viewport cell position, prepare its image for the GPU, and
-    /// append it to the placements list.
-    fn appendKittyPlacement(
-        self: *State,
-        alloc: Allocator,
-        t: *const terminal.Terminal,
-        image: *const terminal.kitty.graphics.Image,
-        p: *const terminal.kitty.graphics.ImageStorage.Placement,
-        x: i32,
-        y: i32,
-    ) PrepImageError!void {
-        // We need to prep this image for upload if it isn't in the
-        // cache OR it is in the cache but the transmit time doesn't
-        // match meaning this image is different.
-        try self.prepKittyImage(alloc, image);
-
-        // Calculate the dimensions of our image, taking in to
-        // account the rows / columns specified by the placement.
-        const dest_size = p.pixelSize(image.*, t);
-        const cell_offset = p.cellOffset(t);
-
-        const source = p.sourceRect(image.*);
-
-        // Accumulate the placement
-        if (dest_size.width > 0 and dest_size.height > 0) {
-            try self.kitty_placements.append(alloc, .{
-                .image_id = .{ .kitty = image.id },
-                .x = x,
-                .y = y,
-                .z = p.z,
-                .width = dest_size.width,
-                .height = dest_size.height,
-                .cell_offset_x = cell_offset.x,
-                .cell_offset_y = cell_offset.y,
-                .source_x = source.x,
-                .source_y = source.y,
-                .source_width = source.width,
-                .source_height = source.height,
-            });
-        }
-    }
-
-    fn prepKittyVirtualPlacement(
-        self: *State,
-        alloc: Allocator,
-        t: *const terminal.Terminal,
-        p: *const terminal.kitty.graphics.unicode.Placement,
-        cell_size: CellSize,
-    ) PrepImageError!void {
-        const storage = &t.screens.active.kitty_images;
-        const image = storage.imageById(p.image_id) orelse {
-            log.warn(
-                "missing image for virtual placement, ignoring image_id={}",
-                .{p.image_id},
-            );
-            return;
-        };
-        if (image.data.isPending()) return;
-
-        const rp = p.renderPlacement(
-            storage,
-            &image,
-            cell_size.width,
-            cell_size.height,
-        ) catch |err| {
-            log.warn("error rendering virtual placement err={}", .{err});
-            return;
-        };
-
-        // If our placement is zero sized then we don't do anything.
-        if (rp.dest_width == 0 or rp.dest_height == 0) return;
-
-        const viewport: terminal.point.Point = t.screens.active.pages.pointFromPin(
-            .viewport,
-            rp.top_left,
-        ) orelse {
-            // This is unreachable with virtual placements because we should
-            // only ever be looking at virtual placements that are in our
-            // viewport in the renderer and virtual placements only ever take
-            // up one row.
-            unreachable;
-        };
-
-        // Prepare the image for the GPU and store the placement.
-        try self.prepKittyImage(alloc, &image);
-        try self.kitty_placements.append(alloc, .{
-            .image_id = .{ .kitty = image.id },
-            .x = @intCast(rp.top_left.x),
-            .y = @intCast(viewport.viewport.y),
-            .z = -1,
-            .width = rp.dest_width,
-            .height = rp.dest_height,
-            .cell_offset_x = rp.offset_x,
-            .cell_offset_y = rp.offset_y,
-            .source_x = rp.source_x,
-            .source_y = rp.source_y,
-            .source_width = rp.source_width,
-            .source_height = rp.source_height,
-        });
-    }
 
     /// Prepare an image for upload to the GPU.
     fn prepImage(

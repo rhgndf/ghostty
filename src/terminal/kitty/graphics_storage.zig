@@ -415,6 +415,7 @@ pub const ImageStorage = struct {
 
         // This always mutates
         self.markMutated(io);
+        gop.value_ptr.generation = self.generation;
     }
 
     /// How the row operation behind a scrollMarginsBegin/end pair moves
@@ -1778,6 +1779,11 @@ pub const ImageStorage = struct {
 
         /// The z-index for this placement.
         z: i32 = 0,
+
+        /// Generation stamp from the process-wide sequence, assigned when
+        /// this placement is added or replaced under its key. Geometry
+        /// changes such as scrolling and margin clipping do not change it.
+        generation: u64 = 0,
 
         pub const Location = union(enum) {
             /// Exactly placed on a screen pin.
@@ -4421,6 +4427,31 @@ test "storage: placeholderTarget lookup" {
         };
         try testing.expectEqual(expected, s.placeholderTarget(1, 0).?.key);
     }
+}
+
+test "storage placement generation changes when re-added" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const storage = &t.screens.active.kitty_images;
+    try storage.addImage(io, alloc, t.screens.active, .{ .id = 1 });
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .virtual = {} },
+    });
+    const key: ImageStorage.PlacementKey = .{
+        .image_id = 1,
+        .placement_id = .{ .tag = .external, .id = 1 },
+    };
+    const first = storage.placements.get(key).?.generation;
+
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .virtual = {} },
+    });
+    const second = storage.placements.get(key).?.generation;
+    try testing.expect(second > first);
 }
 
 test "storage: animation tick advances and schedules" {

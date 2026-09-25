@@ -4,6 +4,7 @@ const build_options = @import("terminal_options");
 const lib = @import("../lib.zig");
 const CAllocator = lib.alloc.Allocator;
 const kitty_storage = @import("../kitty/graphics_storage.zig");
+const kitty_render = @import("../kitty/graphics_render.zig");
 const kitty_cmd = @import("../kitty/graphics_command.zig");
 const Image = @import("../kitty/graphics_image.zig").Image;
 const grid_ref = @import("grid_ref.zig");
@@ -49,17 +50,36 @@ const PlacementIteratorWrapper = if (build_options.kitty_graphics)
 else
     void;
 
+/// C: GhosttyKittyGraphicsRenderPlacementIterator
+pub const RenderPlacementIterator = if (build_options.kitty_graphics)
+    ?*RenderPlacementIteratorWrapper
+else
+    ?*anyopaque;
+
+const RenderPlacementIteratorWrapper = if (build_options.kitty_graphics)
+    struct {
+        alloc: std.mem.Allocator,
+        fragments: std.ArrayListUnmanaged(kitty_render.Fragment) = .empty,
+        storage: ?*kitty_storage.ImageStorage = null,
+        index: ?usize = null,
+        layer_filter: PlacementLayer = .all,
+    }
+else
+    void;
+
 /// C: GhosttyKittyGraphicsData
 pub const Data = enum(c_int) {
     invalid = 0,
     placement_iterator = 1,
     generation = 2,
+    cell_dependent = 3,
 
     pub fn OutType(comptime self: Data) type {
         return switch (self) {
             .invalid => void,
             .placement_iterator => PlacementIterator,
             .generation => u64,
+            .cell_dependent => bool,
         };
     }
 };
@@ -79,11 +99,13 @@ pub const PlacementData = enum(c_int) {
     columns = 10,
     rows = 11,
     z = 12,
+    generation = 13,
 
     pub fn OutType(comptime self: PlacementData) type {
         return switch (self) {
             .invalid => void,
             .image_id, .placement_id => u32,
+            .generation => u64,
             .is_virtual => bool,
             .x_offset,
             .y_offset,
@@ -133,6 +155,7 @@ fn getTyped(
             };
         },
         .generation => out.* = storage.generation,
+        .cell_dependent => out.* = kitty_render.dependsOnCells(storage),
     }
     return .success;
 }
@@ -163,6 +186,35 @@ pub const PlacementIteratorOption = enum(c_int) {
             .layer => PlacementLayer,
         };
     }
+};
+
+/// C: GhosttyKittyRenderPlacementKind
+pub const RenderPlacementKind = enum(c_int) {
+    placement = 0,
+    virtual = 1,
+    max_value = std.math.maxInt(c_int),
+};
+
+/// C: GhosttyKittyGraphicsRenderPlacement
+pub const RenderPlacement = extern struct {
+    size: usize = @sizeOf(RenderPlacement),
+    kind: RenderPlacementKind = .placement,
+    image: ImageHandle = null,
+    image_id: u32 = 0,
+    placement_id: u32 = 0,
+    image_generation: u64 = 0,
+    placement_generation: u64 = 0,
+    z: i32 = 0,
+    viewport_col: i32 = 0,
+    viewport_row: i32 = 0,
+    offset_x: u32 = 0,
+    offset_y: u32 = 0,
+    dest_width: u32 = 0,
+    dest_height: u32 = 0,
+    source_x: u32 = 0,
+    source_y: u32 = 0,
+    source_width: u32 = 0,
+    source_height: u32 = 0,
 };
 
 /// C: GhosttyKittyImageFormat
@@ -331,6 +383,147 @@ fn placementIteratorSetTyped(
     return .success;
 }
 
+pub fn render_placement_iterator_new(
+    alloc_: ?*const CAllocator,
+    out_: ?*RenderPlacementIterator,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) {
+        if (out_) |out| out.* = null;
+        return .no_value;
+    }
+
+    const out = out_ orelse return .invalid_value;
+    const alloc = lib.alloc.default(alloc_);
+    const ptr = alloc.create(RenderPlacementIteratorWrapper) catch {
+        out.* = null;
+        return .out_of_memory;
+    };
+    ptr.* = .{ .alloc = alloc };
+    out.* = ptr;
+    return .success;
+}
+
+pub fn render_placement_iterator_free(
+    iter_: RenderPlacementIterator,
+) callconv(lib.calling_conv) void {
+    if (comptime !build_options.kitty_graphics) return;
+    const iter = iter_ orelse return;
+    iter.fragments.deinit(iter.alloc);
+    iter.alloc.destroy(iter);
+}
+
+pub fn render_placement_iterator_set(
+    iter_: RenderPlacementIterator,
+    option: PlacementIteratorOption,
+    value: ?*const anyopaque,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+
+    if (comptime std.debug.runtime_safety) {
+        _ = std.enums.fromInt(PlacementIteratorOption, @intFromEnum(option)) orelse {
+            return .invalid_value;
+        };
+    }
+
+    return switch (option) {
+        inline else => |comptime_option| renderPlacementIteratorSetTyped(
+            iter_,
+            comptime_option,
+            @ptrCast(@alignCast(value orelse return .invalid_value)),
+        ),
+    };
+}
+
+fn renderPlacementIteratorSetTyped(
+    iter_: RenderPlacementIterator,
+    comptime option: PlacementIteratorOption,
+    value: *const option.InType(),
+) Result {
+    const iter = iter_ orelse return .invalid_value;
+    switch (option) {
+        .layer => iter.layer_filter = value.*,
+    }
+    return .success;
+}
+
+pub fn render_placement_iterator_update(
+    iter_: RenderPlacementIterator,
+    terminal_: terminal_c.Terminal,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+
+    const iter = iter_ orelse return .invalid_value;
+    const wrapper = terminal_ orelse return .invalid_value;
+    const t = wrapper.terminal;
+    const storage = &t.screens.active.kitty_images;
+
+    const result = kitty_render.collect(iter.alloc, t, .{
+        .width = if (t.cols == 0) 0 else t.width_px / t.cols,
+        .height = if (t.rows == 0) 0 else t.height_px / t.rows,
+    }, &iter.fragments);
+    iter.storage = storage;
+    iter.index = null;
+    result catch return .out_of_memory;
+    return .success;
+}
+
+pub fn render_placement_next(
+    iter_: RenderPlacementIterator,
+) callconv(lib.calling_conv) bool {
+    if (comptime !build_options.kitty_graphics) return false;
+    const iter = iter_ orelse return false;
+
+    var index = if (iter.index) |current| current + 1 else 0;
+    while (index < iter.fragments.items.len) : (index += 1) {
+        if (iter.layer_filter.matches(iter.fragments.items[index].z)) {
+            iter.index = index;
+            return true;
+        }
+    }
+    iter.index = iter.fragments.items.len;
+    return false;
+}
+
+pub fn render_placement_get(
+    iter_: RenderPlacementIterator,
+    out_: ?*RenderPlacement,
+) callconv(lib.calling_conv) Result {
+    if (comptime !build_options.kitty_graphics) return .no_value;
+
+    const iter = iter_ orelse return .invalid_value;
+    const index = iter.index orelse return .invalid_value;
+    if (index >= iter.fragments.items.len) return .invalid_value;
+    const out = out_ orelse return .invalid_value;
+    if (out.size < @sizeOf(RenderPlacement)) return .invalid_value;
+
+    const fragment = iter.fragments.items[index];
+    const storage = iter.storage orelse return .invalid_value;
+    const image = storage.images.getPtr(fragment.image_id) orelse return .invalid_value;
+    const placement = storage.placements.get(fragment.key) orelse return .invalid_value;
+
+    out.kind = switch (fragment.kind) {
+        .placement => .placement,
+        .virtual => .virtual,
+    };
+    out.image = image;
+    out.image_id = fragment.image_id;
+    out.placement_id = fragment.key.placement_id.id;
+    out.image_generation = image.generation;
+    out.placement_generation = placement.generation;
+    out.z = fragment.z;
+    out.viewport_col = fragment.x;
+    out.viewport_row = fragment.y;
+    out.offset_x = fragment.offset_x;
+    out.offset_y = fragment.offset_y;
+    out.dest_width = fragment.width;
+    out.dest_height = fragment.height;
+    out.source_x = fragment.source_x;
+    out.source_y = fragment.source_y;
+    out.source_width = fragment.source_width;
+    out.source_height = fragment.source_height;
+    return .success;
+}
+
 pub fn placement_iterator_next(iter_: PlacementIterator) callconv(lib.calling_conv) bool {
     if (comptime !build_options.kitty_graphics) return false;
 
@@ -409,6 +602,7 @@ fn placementGetTyped(
         .columns => out.* = val.columns,
         .rows => out.* = val.rows,
         .z => out.* = val.z,
+        .generation => out.* = val.generation,
     }
 
     return .success;
@@ -2135,4 +2329,691 @@ test "generation never recurs across resets and screen switches" {
     try testing.expectEqual(Result.success, terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)));
     try testing.expectEqual(Result.success, get(graphics, .generation, @ptrCast(&gen)));
     try testing.expect(gen > gen_alt);
+}
+
+fn newRenderTestTerminal(
+    cols: u16,
+    rows: u16,
+) !terminal_c.Terminal {
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(
+        Result.success,
+        terminal_c.new(&lib.alloc.test_allocator, &t, cols, rows),
+    );
+    errdefer terminal_c.free(t);
+    try testing.expectEqual(
+        Result.success,
+        terminal_c.resize(t, cols, rows, 10, 10),
+    );
+    return t;
+}
+
+fn transmitRenderTestImage(
+    t: terminal_c.Terminal,
+    image_id: u32,
+    width: u32,
+    height: u32,
+) !void {
+    const alloc = testing.allocator;
+    const pixels_len = @as(usize, width) * height * 3;
+    const pixels = try alloc.alloc(u8, pixels_len);
+    defer alloc.free(pixels);
+    @memset(pixels, 0);
+
+    const encoded_len = std.base64.standard.Encoder.calcSize(pixels.len);
+    const encoded = try alloc.alloc(u8, encoded_len);
+    defer alloc.free(encoded);
+    const encoded_data = std.base64.standard.Encoder.encode(encoded, pixels);
+
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "\x1b_Ga=t,t=d,f=24,i={d},s={d},v={d};{s}\x1b\\",
+        .{ image_id, width, height, encoded_data },
+    );
+    defer alloc.free(command);
+    terminal_c.vt_write(t, command.ptr, command.len);
+}
+
+fn defineRenderTestVirtual(
+    t: terminal_c.Terminal,
+    image_id: u32,
+    placement_id: u32,
+    columns: u32,
+    rows: u32,
+) !void {
+    const command = try std.fmt.allocPrint(
+        testing.allocator,
+        "\x1b_Ga=p,i={d},p={d},U=1,c={d},r={d};\x1b\\",
+        .{ image_id, placement_id, columns, rows },
+    );
+    defer testing.allocator.free(command);
+    terminal_c.vt_write(t, command.ptr, command.len);
+}
+
+fn renderTestDiacritic(index: u32) []const u8 {
+    return switch (index) {
+        0 => "\u{0305}",
+        1 => "\u{030D}",
+        2 => "\u{030E}",
+        3 => "\u{0310}",
+        else => unreachable,
+    };
+}
+
+fn writeRenderTestPlaceholder(
+    t: terminal_c.Terminal,
+    row: u16,
+    col: u16,
+    image_id_low: u8,
+    placement_id: u8,
+    image_row: u32,
+    image_col: u32,
+    high_image_id: bool,
+) !void {
+    const alloc = testing.allocator;
+    const underline = try std.fmt.allocPrint(
+        alloc,
+        "\x1b[58;5;{d}m",
+        .{placement_id},
+    );
+    defer alloc.free(underline);
+    const high = if (high_image_id) renderTestDiacritic(1) else "";
+    const command = try std.fmt.allocPrint(
+        alloc,
+        "\x1b[{d};{d}H\x1b[38;5;{d}m{s}\u{10EEEE}{s}{s}{s}",
+        .{
+            @as(u32, row) + 1,
+            @as(u32, col) + 1,
+            image_id_low,
+            underline,
+            renderTestDiacritic(image_row),
+            renderTestDiacritic(image_col),
+            high,
+        },
+    );
+    defer alloc.free(command);
+    terminal_c.vt_write(t, command.ptr, command.len);
+}
+
+fn renderTestCellDependent(t: terminal_c.Terminal) !bool {
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(
+        Result.success,
+        terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)),
+    );
+    var result = false;
+    try testing.expectEqual(
+        Result.success,
+        get(graphics, .cell_dependent, @ptrCast(&result)),
+    );
+    return result;
+}
+
+fn renderTestImageGeneration(
+    t: terminal_c.Terminal,
+    image_id: u32,
+) !u64 {
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(
+        Result.success,
+        terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)),
+    );
+    const image = image_get_handle(graphics, image_id);
+    try testing.expect(image != null);
+    var result: u64 = 0;
+    try testing.expectEqual(
+        Result.success,
+        image_get(image, .generation, @ptrCast(&result)),
+    );
+    return result;
+}
+
+fn collectRenderTestPlacements(
+    t: terminal_c.Terminal,
+) ![]RenderPlacement {
+    const alloc = testing.allocator;
+    var iter: RenderPlacementIterator = null;
+    try testing.expectEqual(
+        Result.success,
+        render_placement_iterator_new(&lib.alloc.test_allocator, &iter),
+    );
+    defer render_placement_iterator_free(iter);
+    try testing.expectEqual(
+        Result.success,
+        render_placement_iterator_update(iter, t),
+    );
+
+    var placements: std.ArrayListUnmanaged(RenderPlacement) = .empty;
+    errdefer placements.deinit(alloc);
+    while (render_placement_next(iter)) {
+        var placement: RenderPlacement = .{};
+        try testing.expectEqual(
+            Result.success,
+            render_placement_get(iter, &placement),
+        );
+        try placements.append(alloc, placement);
+    }
+    return placements.toOwnedSlice(alloc);
+}
+
+test "render placement iterator validates arguments and handles empty terminal" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var iter: RenderPlacementIterator = null;
+    try testing.expectEqual(
+        Result.invalid_value,
+        render_placement_iterator_new(&lib.alloc.test_allocator, null),
+    );
+    try testing.expectEqual(
+        Result.success,
+        render_placement_iterator_new(&lib.alloc.test_allocator, &iter),
+    );
+    defer render_placement_iterator_free(iter);
+    render_placement_iterator_free(null);
+
+    var placement: RenderPlacement = .{};
+    try testing.expectEqual(Result.invalid_value, render_placement_get(null, &placement));
+    try testing.expectEqual(Result.invalid_value, render_placement_get(iter, &placement));
+    try testing.expectEqual(Result.invalid_value, render_placement_get(iter, null));
+    try testing.expect(!render_placement_next(null));
+    try testing.expectEqual(
+        Result.invalid_value,
+        render_placement_iterator_update(iter, null),
+    );
+    const layer = PlacementLayer.all;
+    try testing.expectEqual(
+        Result.invalid_value,
+        render_placement_iterator_set(null, .layer, @ptrCast(&layer)),
+    );
+
+    const empty = try newRenderTestTerminal(10, 5);
+    defer terminal_c.free(empty);
+    try testing.expectEqual(
+        Result.success,
+        render_placement_iterator_update(iter, empty),
+    );
+    try testing.expect(!render_placement_next(iter));
+    const empty_fragments = try collectRenderTestPlacements(empty);
+    defer testing.allocator.free(empty_fragments);
+    try testing.expectEqual(@as(usize, 0), empty_fragments.len);
+    try testing.expect(!try renderTestCellDependent(empty));
+}
+
+test "render placement ordinary fragment matches placement geometry and generations" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const t = try newRenderTestTerminal(10, 5);
+    defer terminal_c.free(t);
+    try transmitRenderTestImage(t, 1, 2, 2);
+    const display = "\x1b_Ga=p,i=1,p=5,c=2,r=1,z=4;\x1b\\";
+    terminal_c.vt_write(t, display.ptr, display.len);
+
+    const fragments = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(fragments);
+    try testing.expectEqual(@as(usize, 1), fragments.len);
+    const fragment = fragments[0];
+    try testing.expectEqual(RenderPlacementKind.placement, fragment.kind);
+    try testing.expectEqual(@as(u32, 1), fragment.image_id);
+    try testing.expectEqual(@as(u32, 5), fragment.placement_id);
+    try testing.expectEqual(@as(i32, 4), fragment.z);
+    try testing.expectEqual(@as(i32, 0), fragment.viewport_col);
+    try testing.expectEqual(@as(i32, 0), fragment.viewport_row);
+    try testing.expectEqual(@as(u32, 20), fragment.dest_width);
+    try testing.expectEqual(@as(u32, 10), fragment.dest_height);
+    try testing.expect(fragment.image != null);
+    try testing.expect(!try renderTestCellDependent(t));
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(
+        Result.success,
+        terminal_c.get(t, .kitty_graphics, @ptrCast(&graphics)),
+    );
+    try testing.expectEqual(image_get_handle(graphics, 1), fragment.image);
+    var ordinary: PlacementIterator = null;
+    try testing.expectEqual(
+        Result.success,
+        placement_iterator_new(&lib.alloc.test_allocator, &ordinary),
+    );
+    defer placement_iterator_free(ordinary);
+    try testing.expectEqual(Result.success, get(graphics, .placement_iterator, @ptrCast(&ordinary)));
+    try testing.expect(placement_iterator_next(ordinary));
+
+    const image = image_get_handle(graphics, 1);
+    var image_generation: u64 = 0;
+    try testing.expectEqual(
+        Result.success,
+        image_get(image, .generation, @ptrCast(&image_generation)),
+    );
+    var placement_generation: u64 = 0;
+    try testing.expectEqual(
+        Result.success,
+        placement_get(ordinary, .generation, @ptrCast(&placement_generation)),
+    );
+    try testing.expectEqual(image_generation, fragment.image_generation);
+    try testing.expectEqual(placement_generation, fragment.placement_generation);
+
+    var info: PlacementRenderInfo = .{};
+    try testing.expectEqual(Result.success, placement_render_info(ordinary, image, t, &info));
+    try testing.expectEqual(info.viewport_col, fragment.viewport_col);
+    try testing.expectEqual(info.viewport_row, fragment.viewport_row);
+    try testing.expectEqual(info.pixel_width, fragment.dest_width);
+    try testing.expectEqual(info.pixel_height, fragment.dest_height);
+    try testing.expectEqual(info.source_x, fragment.source_x);
+    try testing.expectEqual(info.source_y, fragment.source_y);
+    try testing.expectEqual(info.source_width, fragment.source_width);
+    try testing.expectEqual(info.source_height, fragment.source_height);
+
+    var render_iter: RenderPlacementIterator = null;
+    try testing.expectEqual(
+        Result.success,
+        render_placement_iterator_new(&lib.alloc.test_allocator, &render_iter),
+    );
+    defer render_placement_iterator_free(render_iter);
+    try testing.expectEqual(Result.success, render_placement_iterator_update(render_iter, t));
+    try testing.expect(render_placement_next(render_iter));
+    var undersized: RenderPlacement = .{};
+    undersized.size = @sizeOf(RenderPlacement) - 1;
+    try testing.expectEqual(
+        Result.invalid_value,
+        render_placement_get(render_iter, &undersized),
+    );
+}
+
+test "render placement keeps pin-rooted relative chains cell independent" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const t = try newRenderTestTerminal(10, 5);
+    defer terminal_c.free(t);
+    try transmitRenderTestImage(t, 1, 1, 1);
+    const parent = "\x1b_Ga=p,i=1,p=1,c=1,r=1;\x1b\\";
+    terminal_c.vt_write(t, parent.ptr, parent.len);
+    const child = "\x1b_Ga=p,i=1,p=2,P=1,Q=1,H=1;\x1b\\";
+    terminal_c.vt_write(t, child.ptr, child.len);
+
+    try testing.expect(!try renderTestCellDependent(t));
+    const fragments = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(fragments);
+    try testing.expectEqual(@as(usize, 2), fragments.len);
+    try testing.expectEqual(@as(u32, 1), fragments[0].placement_id);
+    try testing.expectEqual(@as(i32, 0), fragments[0].viewport_col);
+    try testing.expectEqual(@as(u32, 2), fragments[1].placement_id);
+    try testing.expectEqual(@as(i32, 1), fragments[1].viewport_col);
+}
+
+test "render placement expands virtual placeholder runs in viewport order" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const t = try newRenderTestTerminal(10, 5);
+    defer terminal_c.free(t);
+    terminal_c.vt_write(t, "\x1b[?2027h", 8);
+    try transmitRenderTestImage(t, 1, 4, 4);
+    try defineRenderTestVirtual(t, 1, 8, 2, 2);
+
+    try testing.expect(try renderTestCellDependent(t));
+    const empty = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
+
+    const placeholders =
+        "\x1b[38;5;1m\x1b[58;5;8m" ++
+        "\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}\r\n" ++
+        "\u{10EEEE}\u{030D}\u{0305}\u{10EEEE}\u{030D}\u{030D}\r\n" ++
+        "\x1b[5G\u{10EEEE}\u{0305}\u{0305}";
+    terminal_c.vt_write(t, placeholders.ptr, placeholders.len);
+
+    const fragments = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(fragments);
+    try testing.expectEqual(@as(usize, 3), fragments.len);
+    const expected_origins = [_][2]i32{ .{ 0, 0 }, .{ 0, 1 }, .{ 4, 2 } };
+    const expected_source_width = [_]u32{ 4, 4, 2 };
+    const expected_dest_width = [_]u32{ 20, 20, 10 };
+    const expected_source_y = [_]u32{ 0, 2, 0 };
+    for (fragments, 0..) |fragment, i| {
+        try testing.expectEqual(RenderPlacementKind.virtual, fragment.kind);
+        try testing.expectEqual(@as(u32, 1), fragment.image_id);
+        try testing.expectEqual(@as(u32, 8), fragment.placement_id);
+        try testing.expectEqual(@as(i32, -1), fragment.z);
+        try testing.expectEqual(expected_origins[i][0], fragment.viewport_col);
+        try testing.expectEqual(expected_origins[i][1], fragment.viewport_row);
+        try testing.expectEqual(@as(u32, 0), fragment.source_x);
+        try testing.expectEqual(expected_source_y[i], fragment.source_y);
+        try testing.expectEqual(expected_source_width[i], fragment.source_width);
+        try testing.expectEqual(@as(u32, 2), fragment.source_height);
+        try testing.expectEqual(expected_dest_width[i], fragment.dest_width);
+        try testing.expectEqual(@as(u32, 10), fragment.dest_height);
+    }
+    try testing.expectEqual(fragments[0].image_generation, fragments[1].image_generation);
+    try testing.expectEqual(fragments[1].image_generation, fragments[2].image_generation);
+    try testing.expectEqual(fragments[0].placement_generation, fragments[1].placement_generation);
+    try testing.expectEqual(fragments[1].placement_generation, fragments[2].placement_generation);
+}
+
+test "render placement resolves high image IDs, implicit definitions, and malformed placeholders" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const t = try newRenderTestTerminal(10, 5);
+    defer terminal_c.free(t);
+    terminal_c.vt_write(t, "\x1b[?2027h", 8);
+    try transmitRenderTestImage(t, 16_777_217, 1, 1);
+    try transmitRenderTestImage(t, 1, 1, 1);
+    try transmitRenderTestImage(t, 2, 1, 1);
+    try defineRenderTestVirtual(t, 16_777_217, 7, 1, 1);
+    try defineRenderTestVirtual(t, 1, 9, 1, 1);
+    try defineRenderTestVirtual(t, 2, 0, 1, 1);
+
+    // The third diacritic supplies image-ID bit 24; the underline color
+    // chooses placement 7. An unset underline color selects the default
+    // placement ID 0 when the image has an implicit definition.
+    try writeRenderTestPlaceholder(t, 0, 0, 1, 7, 0, 0, true);
+    try writeRenderTestPlaceholder(t, 0, 2, 1, 0, 0, 0, false);
+    try writeRenderTestPlaceholder(t, 0, 4, 2, 0, 0, 0, false);
+
+    // These malformed or unresolved references must not produce fragments.
+    try writeRenderTestPlaceholder(t, 1, 0, 1, 99, 0, 0, false);
+    try writeRenderTestPlaceholder(t, 1, 2, 3, 0, 0, 0, false);
+    const no_foreground =
+        "\x1b[2;5H\x1b[39m\x1b[58;5;7m\u{10EEEE}\u{0305}\u{0305}";
+    terminal_c.vt_write(t, no_foreground.ptr, no_foreground.len);
+    const invalid_diacritic =
+        "\x1b[2;7H\x1b[38;5;1m\x1b[58;5;99m\u{10EEEE}\u{0300}\u{0300}";
+    terminal_c.vt_write(t, invalid_diacritic.ptr, invalid_diacritic.len);
+
+    const fragments = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(fragments);
+    try testing.expectEqual(@as(usize, 3), fragments.len);
+    try testing.expectEqual(@as(u32, 1), fragments[0].image_id);
+    try testing.expectEqual(@as(u32, 9), fragments[0].placement_id);
+    try testing.expectEqual(@as(i32, 2), fragments[0].viewport_col);
+    try testing.expectEqual(@as(u32, 2), fragments[1].image_id);
+    try testing.expectEqual(@as(u32, 0), fragments[1].placement_id);
+    try testing.expectEqual(@as(i32, 4), fragments[1].viewport_col);
+    try testing.expectEqual(@as(u32, 16_777_217), fragments[2].image_id);
+    try testing.expectEqual(@as(u32, 7), fragments[2].placement_id);
+    try testing.expectEqual(@as(i32, 0), fragments[2].viewport_col);
+}
+
+test "render placement sorts by effective layer and positions virtual-rooted relatives" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const t = try newRenderTestTerminal(10, 5);
+    defer terminal_c.free(t);
+    terminal_c.vt_write(t, "\x1b[?2027h", 8);
+    try transmitRenderTestImage(t, 1, 2, 2);
+
+    const below_bg = "\x1b_Ga=p,i=1,p=1,z=-1073741825,c=1,r=1;\x1b\\";
+    terminal_c.vt_write(t, below_bg.ptr, below_bg.len);
+    try defineRenderTestVirtual(t, 1, 2, 1, 1);
+    const above_text = "\x1b_Ga=p,i=1,p=3,z=4,c=1,r=1;\x1b\\";
+    terminal_c.vt_write(t, above_text.ptr, above_text.len);
+    const relative = "\x1b_Ga=p,i=1,p=4,P=1,Q=2,H=1;\x1b\\";
+    terminal_c.vt_write(t, relative.ptr, relative.len);
+    try writeRenderTestPlaceholder(t, 1, 2, 1, 2, 0, 0, false);
+
+    const fragments = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(fragments);
+    try testing.expectEqual(@as(usize, 4), fragments.len);
+    try testing.expectEqual(@as(i32, -1_073_741_825), fragments[0].z);
+    try testing.expectEqual(@as(u32, 1), fragments[0].placement_id);
+    try testing.expectEqual(@as(i32, -1), fragments[1].z);
+    try testing.expectEqual(RenderPlacementKind.virtual, fragments[1].kind);
+    try testing.expectEqual(@as(u32, 2), fragments[1].placement_id);
+    try testing.expectEqual(@as(i32, 0), fragments[2].z);
+    try testing.expectEqual(RenderPlacementKind.placement, fragments[2].kind);
+    try testing.expectEqual(@as(u32, 4), fragments[2].placement_id);
+    try testing.expectEqual(@as(i32, 3), fragments[2].viewport_col);
+    try testing.expectEqual(@as(i32, 1), fragments[2].viewport_row);
+    try testing.expectEqual(@as(i32, 4), fragments[3].z);
+    try testing.expect(try renderTestCellDependent(t));
+
+    var iter: RenderPlacementIterator = null;
+    try testing.expectEqual(
+        Result.success,
+        render_placement_iterator_new(&lib.alloc.test_allocator, &iter),
+    );
+    defer render_placement_iterator_free(iter);
+    var layer = PlacementLayer.below_bg;
+    try testing.expectEqual(
+        Result.success,
+        render_placement_iterator_set(iter, .layer, @ptrCast(&layer)),
+    );
+    try testing.expectEqual(Result.success, render_placement_iterator_update(iter, t));
+    try testing.expect(render_placement_next(iter));
+    var value: RenderPlacement = .{};
+    try testing.expectEqual(Result.success, render_placement_get(iter, &value));
+    try testing.expectEqual(@as(i32, -1_073_741_825), value.z);
+    try testing.expect(!render_placement_next(iter));
+
+    layer = .below_text;
+    try testing.expectEqual(
+        Result.success,
+        render_placement_iterator_set(iter, .layer, @ptrCast(&layer)),
+    );
+    try testing.expectEqual(Result.success, render_placement_iterator_update(iter, t));
+    try testing.expect(render_placement_next(iter));
+    try testing.expectEqual(Result.success, render_placement_get(iter, &value));
+    try testing.expectEqual(RenderPlacementKind.virtual, value.kind);
+    try testing.expectEqual(@as(i32, -1), value.z);
+    try testing.expect(!render_placement_next(iter));
+
+    layer = .above_text;
+    try testing.expectEqual(
+        Result.success,
+        render_placement_iterator_set(iter, .layer, @ptrCast(&layer)),
+    );
+    try testing.expectEqual(Result.success, render_placement_iterator_update(iter, t));
+    try testing.expect(render_placement_next(iter));
+    try testing.expectEqual(Result.success, render_placement_get(iter, &value));
+    try testing.expectEqual(@as(u32, 4), value.placement_id);
+    try testing.expect(render_placement_next(iter));
+    try testing.expectEqual(Result.success, render_placement_get(iter, &value));
+    try testing.expectEqual(@as(u32, 3), value.placement_id);
+    try testing.expect(!render_placement_next(iter));
+}
+
+test "render placement follows viewport scrolling and clips only ordinary visibility" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const t = try newRenderTestTerminal(10, 5);
+    defer terminal_c.free(t);
+    terminal_c.vt_write(t, "\x1b[?2027h", 8);
+    try transmitRenderTestImage(t, 1, 2, 2);
+    try defineRenderTestVirtual(t, 1, 5, 1, 1);
+
+    try writeRenderTestPlaceholder(t, 4, 2, 1, 5, 0, 0, false);
+    try writeRenderTestPlaceholder(t, 0, 0, 1, 5, 0, 0, false);
+    try writeRenderTestPlaceholder(t, 1, 9, 1, 5, 0, 0, false);
+
+    const ordinary =
+        "\x1b[1;10H\x1b_Ga=p,i=1,p=10,c=2,r=2,C=1;\x1b\\" ++
+        "\x1b[5;1H\x1b_Ga=p,i=1,p=11,c=1,r=2,C=1;\x1b\\" ++
+        "\x1b[1;6H\x1b_Ga=p,i=1,p=12,c=1,r=2,C=1;\x1b\\" ++
+        "\x1b[1;8H\x1b_Ga=p,i=1,p=13,c=1,r=1,C=1;\x1b\\";
+    terminal_c.vt_write(t, ordinary.ptr, ordinary.len);
+
+    const before_scroll = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(before_scroll);
+    var virtual_count: usize = 0;
+    for (before_scroll) |fragment| {
+        if (fragment.kind == .virtual) virtual_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), virtual_count);
+
+    const scroll = "\x1b[5;1H\n";
+    terminal_c.vt_write(t, scroll.ptr, scroll.len);
+    const after_scroll = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(after_scroll);
+    virtual_count = 0;
+    var saw_right_partial = false;
+    var saw_bottom_partial = false;
+    var saw_above_partial = false;
+    var saw_fully_offscreen = false;
+    for (after_scroll) |fragment| {
+        if (fragment.kind == .virtual) {
+            virtual_count += 1;
+            continue;
+        }
+        switch (fragment.placement_id) {
+            10 => {
+                saw_right_partial = fragment.viewport_col == 9 and
+                    fragment.viewport_row == -1 and fragment.dest_width == 20;
+            },
+            11 => {
+                saw_bottom_partial = fragment.viewport_col == 0 and
+                    fragment.viewport_row == 3 and fragment.dest_height == 20;
+            },
+            12 => saw_above_partial = fragment.viewport_row == -1,
+            13 => saw_fully_offscreen = true,
+            else => {},
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), virtual_count);
+    try testing.expect(saw_right_partial);
+    try testing.expect(saw_bottom_partial);
+    try testing.expect(saw_above_partial);
+    try testing.expect(!saw_fully_offscreen);
+
+    terminal_c.scroll_viewport(t, .{ .tag = .top, .value = undefined });
+    const scrolled_view = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(scrolled_view);
+    virtual_count = 0;
+    var saw_top_left = false;
+    var saw_top_right = false;
+    var saw_bottom_left = false;
+    for (scrolled_view) |fragment| {
+        if (fragment.kind != .virtual) continue;
+        virtual_count += 1;
+        if (fragment.viewport_row == 0 and fragment.viewport_col == 0) saw_top_left = true;
+        if (fragment.viewport_row == 1 and fragment.viewport_col == 9) saw_top_right = true;
+        if (fragment.viewport_row == 4 and fragment.viewport_col == 2) saw_bottom_left = true;
+    }
+    try testing.expectEqual(@as(usize, 3), virtual_count);
+    try testing.expect(saw_top_left and saw_top_right and saw_bottom_left);
+}
+
+test "render placement splits wide-cell runs and isolates primary and alternate screens" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const t = try newRenderTestTerminal(10, 5);
+    defer terminal_c.free(t);
+    terminal_c.vt_write(t, "\x1b[?2027h", 8);
+    try transmitRenderTestImage(t, 1, 1, 1);
+    try defineRenderTestVirtual(t, 1, 5, 1, 1);
+    try writeRenderTestPlaceholder(t, 0, 0, 1, 5, 0, 0, false);
+    terminal_c.vt_write(t, "\x1b[1;2H界", "\x1b[1;2H界".len);
+    try writeRenderTestPlaceholder(t, 0, 3, 1, 5, 0, 0, false);
+
+    const main_fragments = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(main_fragments);
+    try testing.expectEqual(@as(usize, 2), main_fragments.len);
+    try testing.expectEqual(@as(i32, 0), main_fragments[0].viewport_col);
+    try testing.expectEqual(@as(i32, 3), main_fragments[1].viewport_col);
+
+    terminal_c.vt_write(t, "\x1b[?1049h", 8);
+    const alternate = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(alternate);
+    try testing.expectEqual(@as(usize, 0), alternate.len);
+    try transmitRenderTestImage(t, 1, 1, 1);
+    try defineRenderTestVirtual(t, 1, 5, 1, 1);
+    try writeRenderTestPlaceholder(t, 2, 2, 1, 5, 0, 0, false);
+    const alt_fragments = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(alt_fragments);
+    try testing.expectEqual(@as(usize, 1), alt_fragments.len);
+    try testing.expectEqual(@as(i32, 2), alt_fragments[0].viewport_col);
+
+    terminal_c.vt_write(t, "\x1b[?1049l", 8);
+    const restored = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(restored);
+    try testing.expectEqual(@as(usize, 2), restored.len);
+    try testing.expectEqual(@as(i32, 0), restored[0].viewport_col);
+    try testing.expectEqual(@as(i32, 3), restored[1].viewport_col);
+}
+
+test "render placement generations track replacement and deletion" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const t = try newRenderTestTerminal(10, 5);
+    defer terminal_c.free(t);
+    try transmitRenderTestImage(t, 1, 1, 1);
+    const display = "\x1b_Ga=p,i=1,p=5,c=1,r=1;\x1b\\";
+    terminal_c.vt_write(t, display.ptr, display.len);
+
+    const first = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(first);
+    try testing.expectEqual(@as(usize, 1), first.len);
+
+    const replace_placement = "\x1b_Ga=p,i=1,p=5,c=1,r=1,z=3;\x1b\\";
+    terminal_c.vt_write(t, replace_placement.ptr, replace_placement.len);
+    const replaced = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(replaced);
+    try testing.expectEqual(@as(usize, 1), replaced.len);
+    try testing.expect(replaced[0].placement_generation > first[0].placement_generation);
+
+    try transmitRenderTestImage(t, 1, 1, 1);
+    const retransmitted_generation = try renderTestImageGeneration(t, 1);
+    try testing.expect(retransmitted_generation > first[0].image_generation);
+    const retransmitted = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(retransmitted);
+    try testing.expectEqual(@as(usize, 0), retransmitted.len);
+
+    terminal_c.vt_write(t, display.ptr, display.len);
+    const delete_placement = "\x1b_Ga=d,d=i,i=1,p=5;\x1b\\";
+    terminal_c.vt_write(t, delete_placement.ptr, delete_placement.len);
+    const deleted = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(deleted);
+    try testing.expectEqual(@as(usize, 0), deleted.len);
+
+    terminal_c.vt_write(t, display.ptr, display.len);
+    const delete_image = "\x1b_Ga=d,d=i,i=1;\x1b\\";
+    terminal_c.vt_write(t, delete_image.ptr, delete_image.len);
+    const deleted_image = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(deleted_image);
+    try testing.expectEqual(@as(usize, 0), deleted_image.len);
+}
+
+test "render placement follows cells through terminal reflow" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const t = try newRenderTestTerminal(10, 5);
+    defer terminal_c.free(t);
+    terminal_c.vt_write(t, "\x1b[?2027h", 8);
+    try transmitRenderTestImage(t, 1, 1, 1);
+    try defineRenderTestVirtual(t, 1, 5, 1, 1);
+    try writeRenderTestPlaceholder(t, 0, 8, 1, 5, 0, 0, false);
+    const display = "\x1b[1;9H\x1b_Ga=p,i=1,p=10,c=1,r=1;\x1b\\";
+    terminal_c.vt_write(t, display.ptr, display.len);
+
+    const before = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(before);
+    try testing.expectEqual(@as(usize, 2), before.len);
+    try testing.expectEqual(@as(i32, 8), before[0].viewport_col);
+    try testing.expectEqual(@as(i32, 8), before[1].viewport_col);
+    try testing.expectEqual(Result.success, terminal_c.resize(t, 5, 5, 10, 10));
+
+    const after = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(after);
+    try testing.expectEqual(@as(usize, 2), after.len);
+    for (after) |fragment| {
+        try testing.expectEqual(@as(i32, 3), fragment.viewport_col);
+        try testing.expectEqual(@as(i32, 1), fragment.viewport_row);
+    }
+}
+
+test "render placement without pixel geometry skips virtual expansion" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(
+        Result.success,
+        terminal_c.new(&lib.alloc.test_allocator, &t, 10, 5),
+    );
+    defer terminal_c.free(t);
+    try transmitRenderTestImage(t, 1, 1, 1);
+    try defineRenderTestVirtual(t, 1, 5, 1, 1);
+    terminal_c.vt_write(t, "\x1b[?2027h", 8);
+    try writeRenderTestPlaceholder(t, 0, 0, 1, 5, 0, 0, false);
+
+    try testing.expect(try renderTestCellDependent(t));
+    const fragments = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(fragments);
+    try testing.expectEqual(@as(usize, 0), fragments.len);
 }
