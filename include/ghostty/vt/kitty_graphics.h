@@ -553,9 +553,10 @@ typedef enum GHOSTTY_ENUM_TYPED {
 /**
  * One renderable fragment from the active screen's viewport.
  *
- * Geometry and generation values are copied into the iterator. The image
- * handle is borrowed from terminal storage and is invalidated by any
- * mutating terminal call.
+ * All placement fields except the image handle are copied at update time.
+ * The image handle and pixel data accessed through it are borrowed from
+ * terminal storage and remain valid only until the terminal is mutated; do
+ * not mutate the terminal while using the iterator.
  *
  * Initialize with GHOSTTY_INIT_SIZED(GhosttyKittyGraphicsRenderPlacement)
  * before calling ghostty_kitty_graphics_render_placement_get().
@@ -1032,8 +1033,9 @@ GHOSTTY_API GhosttyResult ghostty_kitty_graphics_render_placement_iterator_set(
  * with non-zero cell pixel dimensions.
  *
  * The iterator retains its layer filter and resets to before-first after
- * the update. The geometry is copied, but image handles and pixel pointers
- * remain borrowed and are invalidated by any mutating terminal call.
+ * the update. All placement data, including generations, is copied at
+ * update time. Image handles and pixel data reached through them remain
+ * borrowed and are invalidated by any mutating terminal call.
  *
  * @param iterator The iterator handle
  * @param terminal The terminal handle

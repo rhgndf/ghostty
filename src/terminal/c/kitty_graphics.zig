@@ -60,6 +60,10 @@ const RenderPlacementIteratorWrapper = if (build_options.kitty_graphics)
     struct {
         alloc: std.mem.Allocator,
         fragments: std.ArrayListUnmanaged(kitty_render.Fragment) = .empty,
+        meta: std.ArrayListUnmanaged(struct {
+            image_generation: u64,
+            placement_generation: u64,
+        }) = .empty,
         storage: ?*kitty_storage.ImageStorage = null,
         index: ?usize = null,
         layer_filter: PlacementLayer = .all,
@@ -409,6 +413,7 @@ pub fn render_placement_iterator_free(
     if (comptime !build_options.kitty_graphics) return;
     const iter = iter_ orelse return;
     iter.fragments.deinit(iter.alloc);
+    iter.meta.deinit(iter.alloc);
     iter.alloc.destroy(iter);
 }
 
@@ -457,13 +462,40 @@ pub fn render_placement_iterator_update(
     const t = wrapper.terminal;
     const storage = &t.screens.active.kitty_images;
 
+    iter.index = null;
+    iter.storage = storage;
+    iter.meta.clearRetainingCapacity();
     const result = kitty_render.collect(iter.alloc, t, .{
         .width = if (t.cols == 0) 0 else t.width_px / t.cols,
         .height = if (t.rows == 0) 0 else t.height_px / t.rows,
     }, &iter.fragments);
-    iter.storage = storage;
-    iter.index = null;
-    result catch return .out_of_memory;
+    result catch {
+        iter.fragments.clearRetainingCapacity();
+        iter.meta.clearRetainingCapacity();
+        iter.storage = null;
+        return .out_of_memory;
+    };
+
+    iter.meta.ensureTotalCapacity(iter.alloc, iter.fragments.items.len) catch {
+        iter.fragments.clearRetainingCapacity();
+        iter.meta.clearRetainingCapacity();
+        iter.storage = null;
+        return .out_of_memory;
+    };
+
+    var retained: usize = 0;
+    for (iter.fragments.items) |fragment| {
+        const image = storage.images.getPtr(fragment.image_id) orelse continue;
+        const placement = storage.placements.get(fragment.key) orelse continue;
+
+        iter.fragments.items[retained] = fragment;
+        iter.meta.appendAssumeCapacity(.{
+            .image_generation = image.generation,
+            .placement_generation = placement.generation,
+        });
+        retained += 1;
+    }
+    iter.fragments.items.len = retained;
     return .success;
 }
 
@@ -499,7 +531,7 @@ pub fn render_placement_get(
     const fragment = iter.fragments.items[index];
     const storage = iter.storage orelse return .invalid_value;
     const image = storage.images.getPtr(fragment.image_id) orelse return .invalid_value;
-    const placement = storage.placements.get(fragment.key) orelse return .invalid_value;
+    const meta = iter.meta.items[index];
 
     out.kind = switch (fragment.kind) {
         .placement => .placement,
@@ -508,8 +540,8 @@ pub fn render_placement_get(
     out.image = image;
     out.image_id = fragment.image_id;
     out.placement_id = fragment.key.placement_id.id;
-    out.image_generation = image.generation;
-    out.placement_generation = placement.generation;
+    out.image_generation = meta.image_generation;
+    out.placement_generation = meta.placement_generation;
     out.z = fragment.z;
     out.viewport_col = fragment.x;
     out.viewport_row = fragment.y;
@@ -2708,28 +2740,36 @@ test "render placement resolves high image IDs, implicit definitions, and malfor
     try writeRenderTestPlaceholder(t, 0, 2, 1, 0, 0, 0, false);
     try writeRenderTestPlaceholder(t, 0, 4, 2, 0, 0, 0, false);
 
-    // These malformed or unresolved references must not produce fragments.
+    // Missing definitions, images, and foreground IDs must not produce fragments.
     try writeRenderTestPlaceholder(t, 1, 0, 1, 99, 0, 0, false);
     try writeRenderTestPlaceholder(t, 1, 2, 3, 0, 0, 0, false);
     const no_foreground =
         "\x1b[2;5H\x1b[39m\x1b[58;5;7m\u{10EEEE}\u{0305}\u{0305}";
     terminal_c.vt_write(t, no_foreground.ptr, no_foreground.len);
+    // Invalid row/column diacritics are ignored, so the fragment defaults to
+    // row 0, column 0 in its virtual definition.
     const invalid_diacritic =
-        "\x1b[2;7H\x1b[38;5;1m\x1b[58;5;99m\u{10EEEE}\u{0300}\u{0300}";
+        "\x1b[2;7H\x1b[38;5;1m\x1b[58;5;9m\u{10EEEE}\u{0300}\u{0300}";
     terminal_c.vt_write(t, invalid_diacritic.ptr, invalid_diacritic.len);
 
     const fragments = try collectRenderTestPlacements(t);
     defer testing.allocator.free(fragments);
-    try testing.expectEqual(@as(usize, 3), fragments.len);
+    try testing.expectEqual(@as(usize, 4), fragments.len);
     try testing.expectEqual(@as(u32, 1), fragments[0].image_id);
     try testing.expectEqual(@as(u32, 9), fragments[0].placement_id);
     try testing.expectEqual(@as(i32, 2), fragments[0].viewport_col);
-    try testing.expectEqual(@as(u32, 2), fragments[1].image_id);
-    try testing.expectEqual(@as(u32, 0), fragments[1].placement_id);
-    try testing.expectEqual(@as(i32, 4), fragments[1].viewport_col);
-    try testing.expectEqual(@as(u32, 16_777_217), fragments[2].image_id);
-    try testing.expectEqual(@as(u32, 7), fragments[2].placement_id);
-    try testing.expectEqual(@as(i32, 0), fragments[2].viewport_col);
+    try testing.expectEqual(@as(u32, 1), fragments[1].image_id);
+    try testing.expectEqual(@as(u32, 9), fragments[1].placement_id);
+    try testing.expectEqual(@as(i32, 6), fragments[1].viewport_col);
+    try testing.expectEqual(@as(i32, 1), fragments[1].viewport_row);
+    try testing.expectEqual(@as(u32, 0), fragments[1].source_x);
+    try testing.expectEqual(@as(u32, 0), fragments[1].source_y);
+    try testing.expectEqual(@as(u32, 2), fragments[2].image_id);
+    try testing.expectEqual(@as(u32, 0), fragments[2].placement_id);
+    try testing.expectEqual(@as(i32, 4), fragments[2].viewport_col);
+    try testing.expectEqual(@as(u32, 16_777_217), fragments[3].image_id);
+    try testing.expectEqual(@as(u32, 7), fragments[3].placement_id);
+    try testing.expectEqual(@as(i32, 0), fragments[3].viewport_col);
 }
 
 test "render placement sorts by effective layer and positions virtual-rooted relatives" {
@@ -2896,17 +2936,26 @@ test "render placement splits wide-cell runs and isolates primary and alternate 
     const t = try newRenderTestTerminal(10, 5);
     defer terminal_c.free(t);
     terminal_c.vt_write(t, "\x1b[?2027h", 8);
-    try transmitRenderTestImage(t, 1, 1, 1);
-    try defineRenderTestVirtual(t, 1, 5, 1, 1);
+    try transmitRenderTestImage(t, 1, 3, 1);
+    try defineRenderTestVirtual(t, 1, 5, 3, 1);
     try writeRenderTestPlaceholder(t, 0, 0, 1, 5, 0, 0, false);
-    terminal_c.vt_write(t, "\x1b[1;2H界", "\x1b[1;2H界".len);
-    try writeRenderTestPlaceholder(t, 0, 3, 1, 5, 0, 0, false);
+    try writeRenderTestPlaceholder(t, 0, 1, 1, 5, 0, 1, false);
+    terminal_c.vt_write(t, "\x1b[1;3H界", "\x1b[1;3H界".len);
+    try writeRenderTestPlaceholder(t, 0, 4, 1, 5, 0, 2, false);
 
     const main_fragments = try collectRenderTestPlacements(t);
     defer testing.allocator.free(main_fragments);
     try testing.expectEqual(@as(usize, 2), main_fragments.len);
+    try testing.expectEqual(RenderPlacementKind.virtual, main_fragments[0].kind);
     try testing.expectEqual(@as(i32, 0), main_fragments[0].viewport_col);
-    try testing.expectEqual(@as(i32, 3), main_fragments[1].viewport_col);
+    try testing.expectEqual(@as(u32, 20), main_fragments[0].dest_width);
+    try testing.expectEqual(@as(u32, 0), main_fragments[0].source_x);
+    try testing.expectEqual(@as(u32, 2), main_fragments[0].source_width);
+    try testing.expectEqual(RenderPlacementKind.virtual, main_fragments[1].kind);
+    try testing.expectEqual(@as(i32, 4), main_fragments[1].viewport_col);
+    try testing.expectEqual(@as(u32, 10), main_fragments[1].dest_width);
+    try testing.expectEqual(@as(u32, 2), main_fragments[1].source_x);
+    try testing.expectEqual(@as(u32, 1), main_fragments[1].source_width);
 
     terminal_c.vt_write(t, "\x1b[?1049h", 8);
     const alternate = try collectRenderTestPlacements(t);
@@ -2925,7 +2974,23 @@ test "render placement splits wide-cell runs and isolates primary and alternate 
     defer testing.allocator.free(restored);
     try testing.expectEqual(@as(usize, 2), restored.len);
     try testing.expectEqual(@as(i32, 0), restored[0].viewport_col);
-    try testing.expectEqual(@as(i32, 3), restored[1].viewport_col);
+    try testing.expectEqual(@as(i32, 4), restored[1].viewport_col);
+
+    const wrap_t = try newRenderTestTerminal(10, 5);
+    defer terminal_c.free(wrap_t);
+    terminal_c.vt_write(wrap_t, "\x1b[?2027h", 8);
+    try transmitRenderTestImage(wrap_t, 1, 1, 1);
+    try defineRenderTestVirtual(wrap_t, 1, 5, 1, 1);
+    const wrapping_wide_char = "\x1b[1;10H界";
+    terminal_c.vt_write(wrap_t, wrapping_wide_char.ptr, wrapping_wide_char.len);
+    try writeRenderTestPlaceholder(wrap_t, 0, 8, 1, 5, 0, 0, false);
+
+    const wrapped = try collectRenderTestPlacements(wrap_t);
+    defer testing.allocator.free(wrapped);
+    try testing.expectEqual(@as(usize, 1), wrapped.len);
+    try testing.expectEqual(RenderPlacementKind.virtual, wrapped[0].kind);
+    try testing.expectEqual(@as(i32, 8), wrapped[0].viewport_col);
+    try testing.expectEqual(@as(i32, 0), wrapped[0].viewport_row);
 }
 
 test "render placement generations track replacement and deletion" {
@@ -2951,18 +3016,52 @@ test "render placement generations track replacement and deletion" {
     try transmitRenderTestImage(t, 1, 1, 1);
     const retransmitted_generation = try renderTestImageGeneration(t, 1);
     try testing.expect(retransmitted_generation > first[0].image_generation);
+    const empty_after_retransmit = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(empty_after_retransmit);
+    try testing.expectEqual(@as(usize, 0), empty_after_retransmit.len);
+
+    terminal_c.vt_write(t, display.ptr, display.len);
     const retransmitted = try collectRenderTestPlacements(t);
     defer testing.allocator.free(retransmitted);
-    try testing.expectEqual(@as(usize, 0), retransmitted.len);
+    try testing.expectEqual(@as(usize, 1), retransmitted.len);
+    try testing.expect(retransmitted[0].image_generation > first[0].image_generation);
+    try testing.expectEqual(retransmitted_generation, retransmitted[0].image_generation);
 
-    terminal_c.vt_write(t, display.ptr, display.len);
     const delete_placement = "\x1b_Ga=d,d=i,i=1,p=5;\x1b\\";
     terminal_c.vt_write(t, delete_placement.ptr, delete_placement.len);
-    const deleted = try collectRenderTestPlacements(t);
-    defer testing.allocator.free(deleted);
-    try testing.expectEqual(@as(usize, 0), deleted.len);
+    const deleted_placement = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(deleted_placement);
+    try testing.expectEqual(@as(usize, 0), deleted_placement.len);
 
-    terminal_c.vt_write(t, display.ptr, display.len);
+    terminal_c.vt_write(t, "\x1b[?2027h", 8);
+    try defineRenderTestVirtual(t, 1, 6, 1, 1);
+    try writeRenderTestPlaceholder(t, 0, 0, 1, 6, 0, 0, false);
+    const virtual_first = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(virtual_first);
+    try testing.expectEqual(@as(usize, 1), virtual_first.len);
+    try testing.expectEqual(RenderPlacementKind.virtual, virtual_first[0].kind);
+
+    try defineRenderTestVirtual(t, 1, 6, 1, 1);
+    const virtual_replaced = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(virtual_replaced);
+    try testing.expectEqual(@as(usize, 1), virtual_replaced.len);
+    try testing.expect(
+        virtual_replaced[0].placement_generation >
+            virtual_first[0].placement_generation,
+    );
+
+    const delete_virtual = "\x1b_Ga=d,d=i,i=1,p=6;\x1b\\";
+    terminal_c.vt_write(t, delete_virtual.ptr, delete_virtual.len);
+    const deleted_virtual = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(deleted_virtual);
+    try testing.expectEqual(@as(usize, 0), deleted_virtual.len);
+
+    try defineRenderTestVirtual(t, 1, 6, 1, 1);
+    const virtual_restored = try collectRenderTestPlacements(t);
+    defer testing.allocator.free(virtual_restored);
+    try testing.expectEqual(@as(usize, 1), virtual_restored.len);
+    try testing.expectEqual(RenderPlacementKind.virtual, virtual_restored[0].kind);
+
     const delete_image = "\x1b_Ga=d,d=i,i=1;\x1b\\";
     terminal_c.vt_write(t, delete_image.ptr, delete_image.len);
     const deleted_image = try collectRenderTestPlacements(t);
